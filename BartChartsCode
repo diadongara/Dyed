@@ -1,0 +1,199 @@
+"""
+BART FY25 Statistical Data — Chart Generator
+Source: BART FY25 Annual Comprehensive Financial Report
+
+Generates 3 publication-quality charts:
+  1. Operating Revenue by Category (stacked bar)
+  2. Operating Loss vs Change in Net Position (grouped bar)
+  3. Passenger Boardings by Mode (stacked bar)
+
+Output: bart_charts/ folder with individual PNGs + bart_charts_combined.png
+"""
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import numpy as np
+import os
+
+os.makedirs("bart_charts", exist_ok=True)
+
+# ── Shared style ─────────────────────────────────────────────────────────────
+PALETTE = {
+    "blue":   "#378ADD",
+    "green":  "#1D9E75",
+    "amber":  "#EF9F27",
+    "pink":   "#D4537E",
+    "gray":   "#888780",
+    "red":    "#E24B4A",
+    "purple": "#7F77DD",
+    "teal":   "#5DCAA5",
+}
+BG      = "#FAFAF8"
+TEXT    = "#2C2C2A"
+SUBTEXT = "#73726C"
+GRID    = "#E8E6DF"
+
+def set_style(ax, title, ylabel, xlabel_rot=0):
+    ax.set_facecolor(BG)
+    ax.figure.set_facecolor(BG)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.spines[["left", "bottom"]].set_color(GRID)
+    ax.tick_params(colors=SUBTEXT, labelsize=9)
+    ax.xaxis.label.set_color(SUBTEXT)
+    ax.yaxis.label.set_color(SUBTEXT)
+    ax.set_ylabel(ylabel, fontsize=9, color=SUBTEXT)
+    ax.set_title(title, fontsize=12, fontweight="bold", color=TEXT, pad=12, loc="left")
+    ax.yaxis.grid(True, color=GRID, linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
+    if xlabel_rot:
+        ax.tick_params(axis="x", rotation=xlabel_rot)
+
+def millions(x, _):
+    return f"${x/1e3:.0f}M" if abs(x) >= 1e3 else f"${x:.0f}K"
+
+
+YEARS   = [2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+X       = np.arange(len(YEARS))
+YLABELS = [str(y) for y in YEARS]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. OPERATING REVENUE BY CATEGORY
+# ─────────────────────────────────────────────────────────────────────────────
+rev_fares   = [489583,485674,481783,482644,341587, 62528,135818,188311,218988,243924]
+rev_parking = [ 33543, 35110, 36164, 37015, 28212,  7183, 11592, 14219, 17016, 18083]
+rev_telecom = [  7793,  7647,  7452,  7104,  7890,  9531,  8252,  8624, 10892,  9207]
+rev_ads     = [  9126,  9707, 11480, 17852,  8159,  1619,  1132,  3332,  2299,  3627]
+rev_other   = [  5756,  9382, 10715, 10070,  9065, 13629,  9318,  7205,  9479,  7224]
+
+fig1, ax1 = plt.subplots(figsize=(11, 5.5))
+b1 = ax1.bar(X, rev_fares,   color=PALETTE["blue"],   label="Passenger Fares",  alpha=0.9, zorder=3)
+b2 = ax1.bar(X, rev_parking, color=PALETTE["green"],  label="Parking",          alpha=0.9, zorder=3, bottom=rev_fares)
+b3 = ax1.bar(X, rev_telecom, color=PALETTE["amber"],  label="Telecom",          alpha=0.9, zorder=3,
+             bottom=[a+b for a,b in zip(rev_fares, rev_parking)])
+b4 = ax1.bar(X, rev_ads,     color=PALETTE["pink"],   label="Advertising",      alpha=0.9, zorder=3,
+             bottom=[a+b+c for a,b,c in zip(rev_fares, rev_parking, rev_telecom)])
+b5 = ax1.bar(X, rev_other,   color=PALETTE["gray"],   label="Other",            alpha=0.9, zorder=3,
+             bottom=[a+b+c+d for a,b,c,d in zip(rev_fares, rev_parking, rev_telecom, rev_ads)])
+
+ax1.set_xticks(X); ax1.set_xticklabels(YLABELS)
+ax1.yaxis.set_major_formatter(mticker.FuncFormatter(millions))
+set_style(ax1, "Operating Revenue by Category  (FY2016–2025)", "Revenue ($000s)")
+
+# Annotate COVID dip
+ax1.annotate("COVID-19\ndrop", xy=(4, 394934), xytext=(3.2, 460000),
+             arrowprops=dict(arrowstyle="->", color=SUBTEXT, lw=0.9),
+             fontsize=8, color=SUBTEXT, ha="center")
+
+ax1.legend(fontsize=8, frameon=False, ncol=5, loc="upper right",
+           labelcolor=SUBTEXT)
+ax1.text(0.0, -0.12, "Source: BART FY25 Annual Comprehensive Financial Report, Table 3",
+         transform=ax1.transAxes, fontsize=7, color=SUBTEXT)
+plt.tight_layout()
+fig1.savefig("bart_charts/1_revenue_by_category.png", dpi=150, bbox_inches="tight")
+plt.close(fig1)
+print("Saved chart 1")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. OPERATING LOSS vs CHANGE IN NET POSITION
+# ─────────────────────────────────────────────────────────────────────────────
+op_loss  = [-288946,-360965,-446202,-443490,-672595,-899255,-886693,-982877,-1088327,-1113419]
+net_chg  = [ 331763, 347267, 197699, 218318, 259682, 323788, 317722, 573016,  409459,  472424]
+sales_tax= [ 241547, 247185, 257883, 280385, 266895, 258522, 310706, 327128,  320133,  317276]
+cap_cont = [ 328123, 342270, 233728, 204176, 256676, 365812, 332321, 593205,  655790,  882190]
+
+fig2, (ax2a, ax2b) = plt.subplots(1, 2, figsize=(13, 5.5))
+
+w = 0.35
+ax2a.bar(X - w/2, op_loss, width=w, color=PALETTE["red"],  alpha=0.85, label="Operating Loss",         zorder=3)
+ax2a.bar(X + w/2, net_chg, width=w, color=PALETTE["green"],alpha=0.85, label="Change in Net Position", zorder=3)
+ax2a.axhline(0, color=GRID, lw=1)
+ax2a.set_xticks(X); ax2a.set_xticklabels(YLABELS, rotation=45, ha="right")
+ax2a.yaxis.set_major_formatter(mticker.FuncFormatter(millions))
+set_style(ax2a, "Operating Loss vs Change in Net Position", "$000s")
+ax2a.legend(fontsize=8, frameon=False, labelcolor=SUBTEXT)
+
+ax2b.plot(YEARS, sales_tax, color=PALETTE["blue"],  marker="o", markersize=5, linewidth=2,
+          label="Sales Tax Revenue", zorder=3)
+ax2b.plot(YEARS, cap_cont,  color=PALETTE["amber"], marker="s", markersize=5, linewidth=2,
+          label="Capital Contributions", zorder=3)
+ax2b.yaxis.set_major_formatter(mticker.FuncFormatter(millions))
+set_style(ax2b, "Key Revenue Offsets", "$000s")
+ax2b.legend(fontsize=8, frameon=False, labelcolor=SUBTEXT)
+
+fig2.text(0.01, -0.04, "Source: BART FY25 ACFR, Table 2", fontsize=7, color=SUBTEXT)
+plt.tight_layout()
+fig2.savefig("bart_charts/2_loss_and_offsets.png", dpi=150, bbox_inches="tight")
+plt.close(fig2)
+print("Saved chart 2")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. PASSENGER BOARDINGS BY MODE
+# ─────────────────────────────────────────────────────────────────────────────
+heavy = [136627,131810,127875,125105,88699,17125,36775,49043,53222,56593]
+mono  = [  1031,   992,   962,   887,  573,  113,  378,  457,  432,  399]
+hybrid= [     0,     0,   208,  2225, 1735,  601, 1072, 1264, 1273, 1377]
+
+fig3, ax3 = plt.subplots(figsize=(11, 5.5))
+ax3.bar(X, heavy,  color=PALETTE["blue"],  label="Heavy Rail",  alpha=0.9, zorder=3)
+ax3.bar(X, mono,   color=PALETTE["green"], label="Monorail",    alpha=0.9, zorder=3, bottom=heavy)
+ax3.bar(X, hybrid, color=PALETTE["amber"], label="Hybrid Rail", alpha=0.9, zorder=3,
+        bottom=[a+b for a,b in zip(heavy, mono)])
+
+# Recovery annotation
+totals = [a+b+c for a,b,c in zip(heavy, mono, hybrid)]
+fy19 = totals[3]
+for i, (yr, tot) in enumerate(zip(YEARS, totals)):
+    pct = tot / fy19 * 100
+    ax3.text(i, tot + 1500, f"{pct:.0f}%", ha="center", va="bottom",
+             fontsize=7, color=SUBTEXT, fontweight="500")
+
+ax3.set_xticks(X); ax3.set_xticklabels(YLABELS)
+ax3.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x/1e3:.0f}M" if x >= 1e3 else f"{x:.0f}K"))
+set_style(ax3, "Passenger Boardings by Mode  (FY2016–2025)", "Boardings (000s)")
+ax3.legend(fontsize=8, frameon=False, ncol=3, loc="upper right", labelcolor=SUBTEXT)
+
+ax3.annotate("% = share of FY19\n(pre-COVID baseline)", xy=(3, fy19 + 8000),
+             xytext=(5.5, 110000), fontsize=7.5, color=SUBTEXT,
+             arrowprops=dict(arrowstyle="->", color=SUBTEXT, lw=0.8),
+             ha="center")
+
+ax3.text(0.0, -0.12, "Source: BART FY25 ACFR, Table 23 | National Transit Database",
+         transform=ax3.transAxes, fontsize=7, color=SUBTEXT)
+plt.tight_layout()
+fig3.savefig("bart_charts/3_boardings_by_mode.png", dpi=150, bbox_inches="tight")
+plt.close(fig3)
+print("Saved chart 3")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMBINED FIGURE  (3 charts stacked vertically)
+# ─────────────────────────────────────────────────────────────────────────────
+from PIL import Image
+
+imgs = [
+    Image.open(f"bart_charts/{i}.png")
+    for i in [
+        "1_revenue_by_category",
+        "2_loss_and_offsets",
+        "3_boardings_by_mode",
+    ]
+]
+
+# Resize to uniform width
+W = 1600
+resized = []
+for img in imgs:
+    ratio = W / img.width
+    resized.append(img.resize((W, int(img.height * ratio)), Image.LANCZOS))
+
+combined = Image.new("RGB", (W, sum(i.height for i in resized)), BG)
+y = 0
+for img in resized:
+    combined.paste(img, (0, y))
+    y += img.height
+
+combined.save("bart_charts/bart_charts_combined.png", dpi=(150, 150))
+print("Saved combined chart")
+
+print("\nAll charts saved to: ./bart_charts/")
