@@ -216,47 +216,6 @@ fig.savefig(out4, dpi=160, bbox_inches="tight", facecolor=BG)
 plt.close(fig)
 print(f"Saved {out4}")
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# CHART 5 — State YoY Change: Biggest Gainers & Decliners (2022 → 2024)
-# ═══════════════════════════════════════════════════════════════════════════════
-fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-fig.patch.set_facecolor(BG)
-fig.suptitle("STATE FUNDING CHANGE: 2022 → 2024  (%)", fontsize=13,
-             fontweight="bold", color=TEXT, x=0.02, ha="left")
-
-for ax, data, title, color in [
-    (axes[0], top_gainers,   "BIGGEST GAINERS",   "#3ab8e0"),
-    (axes[1], top_decliners, "BIGGEST DECLINES",  "#e05c3a"),
-]:
-    states = [s for s, _ in data]
-    pcts   = [p for _, p in data]
-    y_pos  = np.arange(len(states))
-    bars   = ax.barh(y_pos, pcts, color=color, alpha=0.85, zorder=3)
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(states, fontsize=11)
-    ax.set_title(title, fontsize=11, color=color, pad=10, loc="left")
-    ax.axvline(0, color=MUTED, linewidth=0.8, zorder=4)
-    ax.grid(axis="x", zorder=0)
-    ax.tick_params(axis="x", labelsize=9)
-    ax.xaxis.set_major_formatter(mticker.PercentFormatter())
-    ax.invert_yaxis()
-    for bar, pct in zip(bars, pcts):
-        ax.text(pct + (1 if pct >= 0 else -1),
-                bar.get_y() + bar.get_height() / 2,
-                f"{pct:+.0f}%", va="center", fontsize=9,
-                ha="left" if pct >= 0 else "right", color=TEXT)
-
-fig.tight_layout(rect=[0, 0, 1, 0.93])
-out5 = os.path.join(OUTPUT_DIR, "05_state_yoy_change.png")
-fig.savefig(out5, dpi=160, bbox_inches="tight", facecolor=BG)
-plt.close(fig)
-print(f"Saved {out5}")
-
-
-
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\n✅  All 4 charts saved to ./{OUTPUT_DIR}/")
 print("\nKey Findings:")
