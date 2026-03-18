@@ -1,0 +1,267 @@
+"""
+U.S. Transit Federal Funding — Post-COVID Analysis (2022–2024)
+Data: NTD Annual Data - Funding Sources (Federal)
+
+Run with:
+    pip install matplotlib pandas seaborn
+    python transit_funding_charts.py
+"""
+
+import csv
+import os
+from collections import defaultdict
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import matplotlib.patches as mpatches
+import numpy as np
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+CSV_FILE = '/Users/divyar/Downloads/2022_-_2024_NTD_Annual_Data_-_Funding_Sources_(Federal)_20260318.csv'
+OUTPUT_DIR = "transit_charts"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+YEARS = ["2022", "2023", "2024"]
+PALETTE = {
+    "2022": "#f5c542",
+    "2023": "#e05c3a",
+    "2024": "#3ab8e0",
+}
+BG      = "#0a0c10"
+SURFACE = "#111318"
+GRID    = "#1e2230"
+TEXT    = "#e8eaf0"
+MUTED   = "#6b7390"
+
+plt.rcParams.update({
+    "figure.facecolor":  BG,
+    "axes.facecolor":    SURFACE,
+    "axes.edgecolor":    GRID,
+    "axes.labelcolor":   TEXT,
+    "axes.titlecolor":   TEXT,
+    "xtick.color":       MUTED,
+    "ytick.color":       MUTED,
+    "text.color":        TEXT,
+    "grid.color":        GRID,
+    "grid.linewidth":    0.6,
+    "font.family":       "monospace",
+    "legend.facecolor":  SURFACE,
+    "legend.edgecolor":  GRID,
+})
+
+def clean_money(val):
+    try:
+        return float(val.replace("$", "").replace(",", "").strip())
+    except Exception:
+        return 0.0
+
+def billions(x, _):
+    return f"${x/1e9:.1f}B"
+
+def millions(x, _):
+    return f"${x/1e6:.0f}M"
+
+# ── LOAD DATA ─────────────────────────────────────────────────────────────────
+with open(CSV_FILE, newline="", encoding="utf-8") as f:
+    rows = list(csv.DictReader(f))
+
+print(f"Loaded {len(rows)} rows across years: {set(r['Report Year'] for r in rows)}")
+
+# ── AGGREGATE ─────────────────────────────────────────────────────────────────
+
+# 1. Total federal funding by year
+total_by_year = defaultdict(float)
+for r in rows:
+    total_by_year[r["Report Year"]] += clean_money(r["Total Federal Funds"])
+
+# 2. Fund-type breakdown by year
+fund_keys = {
+    "Formula\n(5307/5339)": "FTA Urbanized Area Formula Prograp (5307) and Bus & Bus Facilities (5339)",
+    "Capital\n(5309/5337)": "FTA Capital Program (5309) and State of Good Repair (5337)",
+    "Rural\n(5311)":        "FTA Rural Progam (5311)",
+    "Other FTA":            "Other FTA Funds",
+    "Other Federal":        "Other Federal Funds",
+}
+fund_by_type_year = {label: defaultdict(float) for label in fund_keys}
+for r in rows:
+    yr = r["Report Year"]
+    for label, col in fund_keys.items():
+        fund_by_type_year[label][yr] += clean_money(r[col])
+
+# 3. Top 10 agencies (all-time total)
+agency_total = defaultdict(float)
+agency_by_year = defaultdict(lambda: defaultdict(float))
+for r in rows:
+    v = clean_money(r["Total Federal Funds"])
+    agency_total[r["Agency"]] += v
+    agency_by_year[r["Agency"]][r["Report Year"]] += v
+top10_agencies = sorted(agency_total.items(), key=lambda x: -x[1])[:10]
+
+# 4. Top 15 states by year
+state_yr = defaultdict(lambda: defaultdict(float))
+for r in rows:
+    state_yr[r["State"]][r["Report Year"]] += clean_money(r["Total Federal Funds"])
+top15_states = sorted(state_yr.items(), key=lambda x: -sum(x[1].values()))[:15]
+
+# 5. Year-over-year % change by state (2022 → 2024)
+state_changes = {}
+for state, yr_data in state_yr.items():
+    if "2022" in yr_data and "2024" in yr_data and yr_data["2022"] > 0:
+        state_changes[state] = (yr_data["2024"] - yr_data["2022"]) / yr_data["2022"] * 100
+
+top_gainers  = sorted(state_changes.items(), key=lambda x: -x[1])[:8]
+top_decliners = sorted(state_changes.items(), key=lambda x:  x[1])[:8]
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHART 2 — Fund-Type Stacked Bar by Year
+# ═══════════════════════════════════════════════════════════════════════════════
+fig, ax = plt.subplots(figsize=(11, 5))
+fig.patch.set_facecolor(BG)
+
+fund_colors = ["#f5c542", "#e05c3a", "#3ab8e0", "#7e6ef5", "#50c878"]
+labels = list(fund_keys.keys())
+x = np.arange(len(YEARS))
+width = 0.55
+bottoms = np.zeros(len(YEARS))
+
+for i, (label, fc) in enumerate(zip(labels, fund_colors)):
+    vals = np.array([fund_by_type_year[label][yr] for yr in YEARS])
+    bars = ax.bar(x, vals, width, bottom=bottoms, label=label, color=fc, zorder=3)
+    # label segments > 1B
+    for j, (v, b) in enumerate(zip(vals, bottoms)):
+        if v > 5e8:
+            ax.text(x[j], b + v / 2, f"${v/1e9:.1f}B", ha="center", va="center",
+                    fontsize=8, color=BG, fontweight="bold")
+    bottoms += vals
+
+ax.set_xticks(x)
+ax.set_xticklabels(YEARS, fontsize=12)
+ax.yaxis.set_major_formatter(mticker.FuncFormatter(billions))
+ax.set_title("FEDERAL FUNDING BREAKDOWN BY PROGRAM TYPE", fontsize=13,
+             fontweight="bold", color=TEXT, pad=16, loc="left")
+ax.set_ylabel("Federal Funds")
+ax.grid(axis="y", zorder=0)
+ax.legend(loc="upper right", fontsize=9, ncol=1)
+
+fig.tight_layout()
+out2 = os.path.join(OUTPUT_DIR, "02_fund_type_stacked.png")
+fig.savefig(out2, dpi=160, bbox_inches="tight", facecolor=BG)
+plt.close(fig)
+print(f"Saved {out2}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHART 3 — Top 10 Agencies (Horizontal Bar, 3-year grouped)
+# ═══════════════════════════════════════════════════════════════════════════════
+fig, ax = plt.subplots(figsize=(12, 6))
+fig.patch.set_facecolor(BG)
+
+names = [a[:35] + ("…" if len(a) > 35 else "") for a, _ in top10_agencies]
+y_pos = np.arange(len(names))
+height = 0.26
+
+for i, yr in enumerate(YEARS):
+    vals = [agency_by_year[a][yr] for a, _ in top10_agencies]
+    offset = (i - 1) * height
+    bars = ax.barh(y_pos + offset, vals, height, label=yr,
+                   color=PALETTE[yr], zorder=3, alpha=0.92)
+
+ax.set_yticks(y_pos)
+ax.set_yticklabels(names, fontsize=10)
+ax.xaxis.set_major_formatter(mticker.FuncFormatter(billions))
+ax.set_title("TOP 10 AGENCIES — FEDERAL FUNDING 2022–2024", fontsize=13,
+             fontweight="bold", color=TEXT, pad=16, loc="left")
+ax.set_xlabel("Federal Funds Received")
+ax.grid(axis="x", zorder=0)
+ax.legend(fontsize=10)
+ax.invert_yaxis()
+
+fig.tight_layout()
+out3 = os.path.join(OUTPUT_DIR, "03_top10_agencies.png")
+fig.savefig(out3, dpi=160, bbox_inches="tight", facecolor=BG)
+plt.close(fig)
+print(f"Saved {out3}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHART 4 — Top 15 States by Year (Grouped Bar)
+# ═══════════════════════════════════════════════════════════════════════════════
+fig, ax = plt.subplots(figsize=(14, 5))
+fig.patch.set_facecolor(BG)
+
+state_names = [s for s, _ in top15_states]
+x = np.arange(len(state_names))
+width = 0.26
+
+for i, yr in enumerate(YEARS):
+    vals = [state_yr[s][yr] for s in state_names]
+    offset = (i - 1) * width
+    ax.bar(x + offset, vals, width, label=yr, color=PALETTE[yr], zorder=3, alpha=0.92)
+
+ax.set_xticks(x)
+ax.set_xticklabels(state_names, fontsize=10)
+ax.yaxis.set_major_formatter(mticker.FuncFormatter(billions))
+ax.set_title("TOP 15 STATES — FEDERAL TRANSIT FUNDING BY YEAR", fontsize=13,
+             fontweight="bold", color=TEXT, pad=16, loc="left")
+ax.set_ylabel("Federal Funds")
+ax.grid(axis="y", zorder=0)
+ax.legend(fontsize=10)
+
+fig.tight_layout()
+out4 = os.path.join(OUTPUT_DIR, "04_top15_states.png")
+fig.savefig(out4, dpi=160, bbox_inches="tight", facecolor=BG)
+plt.close(fig)
+print(f"Saved {out4}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHART 5 — State YoY Change: Biggest Gainers & Decliners (2022 → 2024)
+# ═══════════════════════════════════════════════════════════════════════════════
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+fig.patch.set_facecolor(BG)
+fig.suptitle("STATE FUNDING CHANGE: 2022 → 2024  (%)", fontsize=13,
+             fontweight="bold", color=TEXT, x=0.02, ha="left")
+
+for ax, data, title, color in [
+    (axes[0], top_gainers,   "BIGGEST GAINERS",   "#3ab8e0"),
+    (axes[1], top_decliners, "BIGGEST DECLINES",  "#e05c3a"),
+]:
+    states = [s for s, _ in data]
+    pcts   = [p for _, p in data]
+    y_pos  = np.arange(len(states))
+    bars   = ax.barh(y_pos, pcts, color=color, alpha=0.85, zorder=3)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(states, fontsize=11)
+    ax.set_title(title, fontsize=11, color=color, pad=10, loc="left")
+    ax.axvline(0, color=MUTED, linewidth=0.8, zorder=4)
+    ax.grid(axis="x", zorder=0)
+    ax.tick_params(axis="x", labelsize=9)
+    ax.xaxis.set_major_formatter(mticker.PercentFormatter())
+    ax.invert_yaxis()
+    for bar, pct in zip(bars, pcts):
+        ax.text(pct + (1 if pct >= 0 else -1),
+                bar.get_y() + bar.get_height() / 2,
+                f"{pct:+.0f}%", va="center", fontsize=9,
+                ha="left" if pct >= 0 else "right", color=TEXT)
+
+fig.tight_layout(rect=[0, 0, 1, 0.93])
+out5 = os.path.join(OUTPUT_DIR, "05_state_yoy_change.png")
+fig.savefig(out5, dpi=160, bbox_inches="tight", facecolor=BG)
+plt.close(fig)
+print(f"Saved {out5}")
+
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n✅  All 4 charts saved to ./{OUTPUT_DIR}/")
+print("\nKey Findings:")
+for yr in YEARS:
+    print(f"  {yr}: ${total_by_year[yr]/1e9:.2f}B total federal transit funding")
+pct_change = (total_by_year["2024"] - total_by_year["2022"]) / total_by_year["2022"] * 100
+print(f"  Overall 2022→2024 change: {pct_change:+.1f}%")
+print(f"  Largest recipient: MTA New York City Transit")
