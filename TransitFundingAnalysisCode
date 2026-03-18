@@ -2,11 +2,6 @@
 U.S. Transit Federal Funding — Post-COVID Analysis (2022–2024)
 Data: NTD Annual Data - Funding Sources (Federal)
 
-Run with:
-    pip install matplotlib pandas seaborn
-    python transit_funding_charts.py
-"""
-
 import csv
 import os
 from collections import defaultdict
