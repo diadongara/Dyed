@@ -1,0 +1,1124 @@
+#!/usr/bin/env python3
+"""
+COVID-19 transit funding → behavior pipeline (MTA evasion + Caltrans active transport).
+Run:  python covid_transport_ml_pipeline.py
+Optional: MPLBACKEND=Agg python covid_transport_ml_pipeline.py   # headless
+Figures are written to ./covid_transport_output/
+"""
+# =============================================================================
+#  INSTALLS & IMPORTS
+# =============================================================================
+import subprocess
+import sys
+from pathlib import Path
+
+pkgs = [
+    "xgboost",
+    "lightgbm",
+    "plotly",
+    "scikit-learn",
+    "pandas",
+    "numpy",
+    "matplotlib",
+    "seaborn",
+    "ruptures",
+    "kaleido",  # optional for static plotly export
+]
+for p in pkgs:
+    subprocess.run([sys.executable, "-m", "pip", "install", p, "-q"], capture_output=True)
+
+import warnings
+
+import lightgbm as lgb
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import xgboost as xgb
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.ensemble import IsolationForest
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+
+try:
+    import ruptures as rpt
+
+    HAS_RUPTURES = True
+except ImportError:
+    HAS_RUPTURES = False
+
+warnings.filterwarnings("ignore")
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+
+OUT_DIR = Path(__file__).resolve().parent / "covid_transport_output"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# COVID reference dates
+COVID_START = pd.Timestamp("2020-03-01")
+COVID_PEAK = pd.Timestamp("2020-07-01")
+RECOVERY = pd.Timestamp("2021-06-01")
+# Months from COVID_START to RECOVERY (for aligning dummy features)
+LOCKDOWN_END_MONTHS = (RECOVERY - COVID_START).days / 30.4375
+
+# Caltrans district numbers → short labels (official district names, condensed)
+CALTRANS_DISTRICT_LABELS = {
+    1: "D1 Eureka",
+    2: "D2 Redding",
+    3: "D3 Marysville / NE",
+    4: "D4 Bay Area",
+    5: "D5 San Luis Obispo",
+    6: "D6 Fresno",
+    7: "D7 Los Angeles",
+    8: "D8 San Bernardino",
+    9: "D9 Bishop / E Sierra",
+    10: "D10 Stockton",
+    11: "D11 San Diego",
+    12: "D12 Orange County",
+}
+
+print("Imports ready")
+print(f"  COVID start   : {COVID_START.date()}")
+print(f"  Funding shock : {COVID_PEAK.date()}")
+print(f"  Recovery mark : {RECOVERY.date()}")
+print(f"  Output dir    : {OUT_DIR}")
+
+
+def savefig(tag):
+    p = OUT_DIR / f"{tag}.png"
+    plt.savefig(p, dpi=150, bbox_inches="tight")
+    print(f"  Saved {p}")
+
+
+def caltrans_feature_row(dt: pd.Timestamp, med: pd.Series) -> dict:
+    """One synthetic hourly row: calendar from dt, spatial/encoded fields from training medians."""
+    dt = pd.Timestamp(dt)
+    _hm = med.get("hour", 12)
+    hour = int(np.round(_hm)) if pd.notna(_hm) else 12
+    dow = int(dt.dayofweek)
+    month = int(dt.month)
+    week = int(dt.isocalendar().week)
+    dayofyear = int(dt.dayofyear)
+    pre_covid = int(dt < COVID_START)
+    covid_lockdown = int((dt >= COVID_START) & (dt < RECOVERY))
+    post_covid = int(dt >= RECOVERY)
+    months_since_covid = max(0.0, (dt - COVID_START).days / 30.44)
+    return {
+        "latitude": med["latitude"],
+        "longitude": med["longitude"],
+        "district": med["district"],
+        "hour": hour,
+        "dow": dow,
+        "month": month,
+        "week": week,
+        "dayofyear": dayofyear,
+        "hour_sin": np.sin(2 * np.pi * hour / 24),
+        "hour_cos": np.cos(2 * np.pi * hour / 24),
+        "dow_sin": np.sin(2 * np.pi * dow / 7),
+        "dow_cos": np.cos(2 * np.pi * dow / 7),
+        "month_sin": np.sin(2 * np.pi * month / 12),
+        "month_cos": np.cos(2 * np.pi * month / 12),
+        "is_weekend": int(dow >= 5),
+        "is_am_peak": int(7 <= hour <= 9),
+        "is_pm_peak": int(16 <= hour <= 19),
+        "direction_enc": med["direction_enc"],
+        "count_type_enc": med["count_type_enc"],
+        "is_bicycle": med["is_bicycle"],
+        "pre_covid": pre_covid,
+        "covid_lockdown": covid_lockdown,
+        "post_covid": post_covid,
+        "months_since_covid": months_since_covid,
+    }
+
+
+def fmt_pct(x):
+    return f"{x:.1f}%" if x is not None and np.isfinite(x) else "N/A"
+
+
+def district_label(d) -> str:
+    try:
+        di = int(float(d))
+    except (TypeError, ValueError):
+        return str(d)
+    return CALTRANS_DISTRICT_LABELS.get(di, f"Caltrans Dist. {di}")
+
+
+def _caltrans_year_sort_key(x):
+    """Sort year-like keys (2023, 2024) numerically; fall back to string order."""
+    s = str(x)
+    return (0, int(s)) if s.isdigit() else (1, s)
+
+
+def discover_caltrans_sessions(downloads_dir: Path):
+    """One bicycle + pedestrian file per year; prefer duplicates without ' (1)'."""
+    out_bike = []
+    out_ped = []
+    for pattern, bucket in (
+        ("caltrans_bicycle_hourly_count_*.csv", out_bike),
+        ("caltrans_pedestrian_hourly_count_*.csv", out_ped),
+    ):
+        by_year = {}
+        for p in sorted(downloads_dir.glob(pattern)):
+            stem = p.stem
+            parts = stem.replace(" ", "").split("_")
+            year_key = parts[-1] if parts and parts[-1].isdigit() else p.name
+            prefer = 0 if " (1)" in p.name else 1
+            t = p.stat().st_mtime
+            prev = by_year.get(year_key)
+            if prev is None or (prefer, t) > (prev[0], prev[1]):
+                by_year[year_key] = (prefer, t, p)
+        for yk in sorted(by_year.keys(), key=_caltrans_year_sort_key):
+            bucket.append(by_year[yk][2])
+    return out_bike, out_ped
+
+
+def concat_csvs(paths, label):
+    if not paths:
+        print(f"  WARNING: no CSVs found for {label}")
+        return pd.DataFrame()
+    frames = []
+    for p in paths:
+        frames.append(pd.read_csv(p))
+        print(f"    {label}: {p.name} ({len(frames[-1]):,} rows)")
+    return pd.concat(frames, ignore_index=True)
+
+
+# =============================================================================
+#  LOAD DATA (adjust paths if needed)
+# =============================================================================
+DOWNLOADS = Path("/Users/divyar/Downloads")
+MTA_PATH = DOWNLOADS / "MTA_Bus_Fare_Evasion__Beginning_2019.csv"
+
+mta_raw = pd.read_csv(MTA_PATH)
+bike_files, ped_files = discover_caltrans_sessions(DOWNLOADS)
+print("\nLoading Caltrans hourly files …")
+bike_raw = concat_csvs(bike_files, "Bicycle")
+ped_raw = concat_csvs(ped_files, "Pedestrian")
+
+print(f"\nMTA rows         : {len(mta_raw):,}")
+print(f"Bicycle rows     : {len(bike_raw):,}")
+print(f"Pedestrian rows  : {len(ped_raw):,}")
+
+
+# =============================================================================
+#  FEATURE ENGINEERING — CALTRANS
+# =============================================================================
+def engineer_caltrans(df, mode_label):
+    df = df.copy()
+    df.columns = df.columns.str.strip()
+    df["datetime"] = pd.to_datetime(df["date"], utc=False)
+    df["hour"] = df["datetime"].dt.hour
+    df["dow"] = df["datetime"].dt.dayofweek
+    df["month"] = df["datetime"].dt.month
+    df["week"] = df["datetime"].dt.isocalendar().week.astype(int)
+    df["dayofyear"] = df["datetime"].dt.dayofyear
+    df["year"] = df["datetime"].dt.year
+
+    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
+    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
+    df["dow_sin"] = np.sin(2 * np.pi * df["dow"] / 7)
+    df["dow_cos"] = np.cos(2 * np.pi * df["dow"] / 7)
+    df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
+    df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
+
+    df["is_weekend"] = (df["dow"] >= 5).astype(int)
+    df["is_am_peak"] = ((df["hour"] >= 7) & (df["hour"] <= 9)).astype(int)
+    df["is_pm_peak"] = ((df["hour"] >= 16) & (df["hour"] <= 19)).astype(int)
+
+    df["pre_covid"] = (df["datetime"] < COVID_START).astype(int)
+    df["covid_lockdown"] = ((df["datetime"] >= COVID_START) & (df["datetime"] < RECOVERY)).astype(int)
+    df["post_covid"] = (df["datetime"] >= RECOVERY).astype(int)
+    df["months_since_covid"] = ((df["datetime"] - COVID_START).dt.days / 30.44).clip(lower=0)
+
+    le_dir = LabelEncoder()
+    df["direction_enc"] = le_dir.fit_transform(df["direction"].astype(str))
+    le_ct = LabelEncoder()
+    df["count_type_enc"] = le_ct.fit_transform(df["count_type"].astype(str))
+
+    df["mode_label"] = mode_label
+    df = df.dropna(subset=["count"])
+    df["count"] = df["count"].clip(lower=0)
+    return df
+
+
+def report_caltrans_covid_coverage(combined):
+    dt_min, dt_max = combined["datetime"].min(), combined["datetime"].max()
+    print("\nCaltrans datetime span:")
+    print(f"  {dt_min.date()}  →  {dt_max.date()}")
+    for name, mask in [
+        ("pre_covid", combined["pre_covid"] == 1),
+        ("covid_lockdown", combined["covid_lockdown"] == 1),
+        ("post_covid", combined["post_covid"] == 1),
+    ]:
+        n = mask.sum()
+        print(f"  Rows with {name}=1 : {n:,} ({100 * n / len(combined):.2f}%)")
+    if combined["pre_covid"].sum() == 0 and combined["covid_lockdown"].sum() == 0:
+        print(
+            "\n⚠️  Caltrans files have no pre-COVID / lockdown coverage. "
+            "COVID dummy features are constant; use historical hourly data for causal claims. "
+            "Impact clustering below uses an early-vs-late temporal split as a fallback."
+        )
+
+
+print("\nEngineering Caltrans features …")
+bike_feat = engineer_caltrans(bike_raw, "Bicycle")
+ped_feat = engineer_caltrans(ped_raw, "Pedestrian")
+combined = pd.concat([bike_feat, ped_feat], ignore_index=True)
+combined["is_bicycle"] = (combined["mode_label"] == "Bicycle").astype(int)
+print(f"Combined shape: {combined.shape}")
+report_caltrans_covid_coverage(combined)
+
+era_counts = combined.groupby(
+    pd.cut(
+        combined["datetime"],
+        bins=[
+            pd.Timestamp("2000-01-01"),
+            COVID_START,
+            RECOVERY,
+            pd.Timestamp("2030-01-01"),
+        ],
+        labels=["Pre-COVID", "COVID Lockdown", "Post-COVID"],
+    )
+)["count"].agg(["count", "mean"]).rename(columns={"count": "records", "mean": "avg_count"})
+print("\nActivity by COVID era (calendar bins):")
+print(era_counts)
+
+
+# =============================================================================
+#  COMPONENT 1 — BEHAVIOR SHIFT DETECTION
+# =============================================================================
+print("\n" + "=" * 60)
+print("COMPONENT 1 — Behavior Shift Detection")
+print("=" * 60)
+
+daily = (
+    combined.groupby(combined["datetime"].dt.date)["count"].sum().reset_index()
+)
+daily.columns = ["date", "total_count"]
+daily["date"] = pd.to_datetime(daily["date"])
+daily = daily.sort_values("date").reset_index(drop=True)
+daily["rolling7"] = daily["total_count"].rolling(7, center=True).mean()
+
+iso = IsolationForest(contamination=0.05, random_state=RANDOM_STATE)
+daily["anomaly"] = iso.fit_predict(daily[["total_count"]].fillna(0))
+daily["is_surge"] = (daily["anomaly"] == -1).astype(int)
+
+d_pre = daily[daily["date"] < COVID_START]
+d_post = daily[daily["date"] >= RECOVERY]
+surge_pct_pre = d_pre["is_surge"].mean() * 100 if len(d_pre) else float("nan")
+surge_pct_post = d_post["is_surge"].mean() * 100 if len(d_post) else float("nan")
+print(f"  Surge days pre-COVID : {len(d_pre)} days, rate {fmt_pct(surge_pct_pre)}")
+print(f"  Surge days post-COVID: {len(d_post)} days, rate {fmt_pct(surge_pct_post)}")
+
+bkpt_dates = []
+if HAS_RUPTURES and len(daily.dropna()) > 20:
+    signal = daily["rolling7"].dropna().values
+    algo = rpt.Pelt(model="rbf").fit(signal)
+    try:
+        breakpoints = algo.predict(pen=10)
+        bkpt_dates = [daily["date"].iloc[min(b, len(daily) - 1)] for b in breakpoints[:-1]]
+        print(f"  Change-points detected: {[str(d.date()) for d in bkpt_dates]}")
+    except Exception:
+        pass
+
+fig, ax = plt.subplots(figsize=(14, 5))
+dmin, dmax = daily["date"].min(), daily["date"].max()
+ax.fill_between(daily["date"], daily["total_count"], alpha=0.15, color="steelblue")
+ax.plot(daily["date"], daily["rolling7"], color="steelblue", lw=1.8, label="7-day rolling avg")
+surges = daily[daily["is_surge"] == 1]
+if len(surges):
+    ax.scatter(
+        surges["date"],
+        surges["total_count"],
+        color="red",
+        s=15,
+        zorder=5,
+        alpha=0.6,
+        label="Detected surge (Isolation Forest)",
+    )
+ax.set_xlim(dmin, dmax)
+ymin, ymax = np.nanmin(daily["total_count"]), np.nanmax(daily["total_count"])
+if not np.isfinite(ymin):
+    ymin = 0
+if not np.isfinite(ymax):
+    ymax = 1
+ax.set_ylim(0, ymax * 1.08 if ymax > 0 else 1)
+shade_lo, shade_hi = max(COVID_START, dmin), min(RECOVERY, dmax)
+if shade_lo < shade_hi:
+    ax.axvspan(shade_lo, shade_hi, alpha=0.12, color="red", label="COVID lockdown (within data span)")
+if COVID_START >= dmin and COVID_START <= dmax:
+    ax.axvline(COVID_START, color="red", ls="--", lw=1.2, alpha=0.8)
+if RECOVERY >= dmin and RECOVERY <= dmax:
+    ax.axvline(RECOVERY, color="green", ls="--", lw=1.2, alpha=0.8)
+yy = ax.get_ylim()[1] * 0.93
+if COVID_START >= dmin and COVID_START <= dmax and np.isfinite(yy):
+    ax.text(COVID_START, yy, " COVID\n Start", color="red", fontsize=8)
+if RECOVERY >= dmin and RECOVERY <= dmax and np.isfinite(yy):
+    ax.text(RECOVERY, yy, " Recovery", color="green", fontsize=8)
+for bi, bp in enumerate(bkpt_dates):
+    if dmin <= pd.Timestamp(bp) <= dmax:
+        ax.axvline(
+            bp,
+            color="orange",
+            ls=":",
+            lw=1.5,
+            alpha=0.9,
+            label="Change-point" if bi == 0 else "_nolegend_",
+        )
+ax.set_title("Active Transport Volume Over Time — Behavioral Shift Detection")
+ax.set_xlabel("Date")
+ax.set_ylabel("Daily Count (Ped + Bike)")
+ax.legend(fontsize=8)
+plt.tight_layout()
+savefig("01_daily_active_transport")
+plt.close()
+
+era_avg = {}
+era_n = {}
+for key, mask in [
+    ("Pre-COVID", combined["pre_covid"] == 1),
+    ("COVID Lockdown", combined["covid_lockdown"] == 1),
+    ("Post-COVID", combined["post_covid"] == 1),
+]:
+    sub = combined[mask]
+    era_n[key] = len(sub)
+    era_avg[key] = sub["count"].mean() if era_n[key] else float("nan")
+
+base = era_avg["Pre-COVID"]
+if (
+    np.isfinite(base)
+    and base > 0
+    and np.isfinite(era_avg["Post-COVID"])
+    and era_n.get("Pre-COVID", 0) > 0
+):
+    pct_change = (era_avg["Post-COVID"] - era_avg["Pre-COVID"]) / base * 100
+else:
+    pct_change = float("nan")
+    print("  (Pre→Post % change skipped: no pre-COVID hourly rows in Caltrans merge.)")
+pc_str = f"{pct_change:+.1f}%" if np.isfinite(pct_change) else "N/A"
+print(f"\n  Active transport change Pre → Post COVID: {pc_str}")
+
+
+# =============================================================================
+#  MTA FEATURES
+# =============================================================================
+def engineer_mta(df):
+    df = df.copy()
+    df.columns = df.columns.str.strip()
+    df["Fare Evasion"] = pd.to_numeric(df["Fare Evasion"], errors="coerce")
+    df[["year", "quarter"]] = df["Time Period"].str.extract(r"(\d{4})-Q(\d)").astype(int)
+    df["quarter_index"] = (df["year"] - df["year"].min()) * 4 + df["quarter"]
+    df["approx_date"] = pd.to_datetime(
+        df["year"].astype(str) + "-" + ((df["quarter"] - 1) * 3 + 1).astype(str).str.zfill(2) + "-01"
+    )
+
+    df["pre_covid"] = (df["approx_date"] < COVID_START).astype(int)
+    df["covid_period"] = ((df["approx_date"] >= COVID_START) & (df["approx_date"] < RECOVERY)).astype(int)
+    df["post_covid"] = (df["approx_date"] >= RECOVERY).astype(int)
+    df["quarters_since_covid"] = ((df["approx_date"] - COVID_START).dt.days / 91.25).clip(lower=0)
+
+    le = LabelEncoder()
+    df["trip_type_enc"] = le.fit_transform(df["Trip Type"])
+    df = df.sort_values(["Trip Type", "quarter_index"]).reset_index(drop=True)
+
+    for lag in [1, 2, 4]:
+        df[f"evasion_lag{lag}"] = df.groupby("Trip Type")["Fare Evasion"].shift(lag)
+    df["evasion_roll4"] = df.groupby("Trip Type")["Fare Evasion"].transform(lambda x: x.shift(1).rolling(4).mean())
+
+    def rolling_slope(series):
+        result = series.copy() * np.nan
+        for i in range(4, len(series)):
+            y_vals = series.iloc[i - 4 : i].values
+            if not np.any(np.isnan(y_vals)):
+                result.iloc[i] = np.polyfit(range(4), y_vals, 1)[0]
+        return result
+
+    df["evasion_trend"] = df.groupby("Trip Type")["Fare Evasion"].transform(rolling_slope)
+    df["q_sin"] = np.sin(2 * np.pi * df["quarter"] / 4)
+    df["q_cos"] = np.cos(2 * np.pi * df["quarter"] / 4)
+    return df.dropna(subset=["evasion_lag1"])
+
+
+mta_feat = engineer_mta(mta_raw)
+
+evasion_era = mta_feat[mta_feat["Trip Type"] == "Total"]
+pre = evasion_era[evasion_era["pre_covid"] == 1]["Fare Evasion"].mean()
+cov = evasion_era[evasion_era["covid_period"] == 1]["Fare Evasion"].mean()
+post = evasion_era[evasion_era["post_covid"] == 1]["Fare Evasion"].mean()
+if not np.isfinite(pre):
+    alt = mta_feat[(mta_feat["pre_covid"] == 1) & (mta_feat["Trip Type"] != "Total")]["Fare Evasion"].mean()
+    if np.isfinite(alt):
+        pre = alt
+        print("  (Using pre-COVID mean across Express/Local/SBS — 'Total' has no pre-2020-Q4 rows.)")
+print(f"\nMTA Total Fare Evasion by era:")
+print(f"  Pre-COVID    : {pre:.1%}" if np.isfinite(pre) else "  Pre-COVID    : N/A")
+print(f"  COVID period : {cov:.1%}")
+print(f"  Post-COVID   : {post:.1%}")
+if np.isfinite(pre) and np.isfinite(post):
+    print(f"  → Evasion {'rose' if post > pre else 'fell'} {abs(post - pre):.1%} from pre → post COVID")
+else:
+    print("  → Pre vs post comparison partial (missing pre-COVID Total).")
+
+
+# =============================================================================
+#  COMPONENT 2 — LIGHTGBM FARE EVASION
+# =============================================================================
+print("\n" + "=" * 60)
+print("COMPONENT 2 — LightGBM Fare Evasion Forecast")
+print("=" * 60)
+
+MTA_FEATURES = [
+    "trip_type_enc",
+    "quarter_index",
+    "q_sin",
+    "q_cos",
+    "evasion_lag1",
+    "evasion_lag2",
+    "evasion_lag4",
+    "evasion_roll4",
+    "evasion_trend",
+    "pre_covid",
+    "covid_period",
+    "post_covid",
+    "quarters_since_covid",
+]
+
+X_mta = mta_feat[MTA_FEATURES]
+y_mta = mta_feat["Fare Evasion"]
+
+split = int(len(mta_feat) * 0.8)
+X_tr, X_te = X_mta.iloc[:split], X_mta.iloc[split:]
+y_tr, y_te = y_mta.iloc[:split], y_mta.iloc[split:]
+
+lgb_model = lgb.LGBMRegressor(
+    n_estimators=300,
+    max_depth=5,
+    learning_rate=0.03,
+    num_leaves=15,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_lambda=1.0,
+    random_state=RANDOM_STATE,
+    n_jobs=-1,
+    verbose=-1,
+)
+print("Training LightGBM …")
+lgb_model.fit(
+    X_tr,
+    y_tr,
+    eval_set=[(X_te, y_te)],
+    callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(period=-1)],
+)
+
+y_pred_lgb = lgb_model.predict(X_te).clip(0)
+mae_b = mean_absolute_error(y_te, y_pred_lgb)
+rmse_b = np.sqrt(mean_squared_error(y_te, y_pred_lgb))
+r2_b = r2_score(y_te, y_pred_lgb)
+print(f"  MAE={mae_b:.4f}  RMSE={rmse_b:.4f}  R²={r2_b:.4f}")
+
+test_df = mta_feat.iloc[split:].copy()
+test_df["predicted"] = y_pred_lgb
+
+
+def mta_next_quarter(year: int, quarter: int):
+    if quarter >= 4:
+        return year + 1, 1
+    return year, quarter + 1
+
+
+def mta_project_quarters(mta_full: pd.DataFrame, model, n_future: int = 20):
+    """Recursive quarter-ahead evasion with seasonal anchor + step cap (reduces fake linear drift)."""
+    q_month = {1: 1, 2: 4, 3: 7, 4: 10}
+    rows = []
+    for tt in sorted(mta_full["Trip Type"].unique()):
+        g = mta_full[mta_full["Trip Type"] == tt].sort_values("quarter_index")
+        hist = [float(x) for x in g["Fare Evasion"].values]
+        seasonal = g.groupby("quarter")["Fare Evasion"].mean().to_dict()
+        diffs = np.abs(np.diff(np.asarray(g["Fare Evasion"].values, dtype=float)))
+        max_step = float(np.percentile(diffs, 90)) if len(diffs) else 0.03
+        max_step = max(max_step, 0.008)
+        last = g.iloc[-1]
+        cy, cq = int(last["year"]), int(last["quarter"])
+        qidx = int(last["quarter_index"])
+        prev = hist[-1]
+        for _ in range(n_future):
+            cy, cq = mta_next_quarter(cy, cq)
+            qidx += 1
+            approx_date = pd.Timestamp(year=cy, month=q_month[cq], day=1)
+            pre = int(approx_date < COVID_START)
+            covp = int(COVID_START <= approx_date < RECOVERY)
+            post = int(approx_date >= RECOVERY)
+            q_sc = max(0.0, (approx_date - COVID_START).days / 91.25)
+            e1 = hist[-1]
+            e2 = hist[-2] if len(hist) >= 2 else e1
+            e4 = hist[-4] if len(hist) >= 4 else e1
+            roll4 = float(np.mean(hist[-4:])) if len(hist) >= 4 else float(np.mean(hist))
+            ylag = np.array(hist[-4:], dtype=float)
+            trend = float(np.polyfit(np.arange(len(ylag)), ylag, 1)[0]) if len(hist) >= 4 else 0.0
+            row_dict = {
+                "trip_type_enc": int(last["trip_type_enc"]),
+                "quarter_index": qidx,
+                "q_sin": np.sin(2 * np.pi * cq / 4),
+                "q_cos": np.cos(2 * np.pi * cq / 4),
+                "evasion_lag1": e1,
+                "evasion_lag2": e2,
+                "evasion_lag4": e4,
+                "evasion_roll4": roll4,
+                "evasion_trend": trend,
+                "pre_covid": pre,
+                "covid_period": covp,
+                "post_covid": post,
+                "quarters_since_covid": q_sc,
+            }
+            xrow = pd.DataFrame([row_dict])[MTA_FEATURES]
+            raw = float(np.clip(model.predict(xrow)[0], 0.0, 0.95))
+            anchor = float(seasonal.get(cq, raw))
+            yhat = 0.68 * raw + 0.32 * anchor
+            yhat = float(np.clip(yhat, prev - max_step, prev + max_step))
+            prev = yhat
+            hist.append(yhat)
+            rows.append({"Trip Type": tt, "approx_date": approx_date, "Fare_Evasion_proj": yhat})
+    return pd.DataFrame(rows)
+
+
+fig_mta = go.Figure()
+colors = {"Express": "#1F77B4", "Local": "#FF7F0E", "SBS": "#2CA02C", "Total": "#D62728"}
+for tt, grp in test_df.groupby("Trip Type"):
+    col = colors.get(tt, "grey")
+    fig_mta.add_trace(
+        go.Scatter(
+            x=grp["approx_date"],
+            y=grp["Fare Evasion"],
+            mode="lines+markers",
+            name=f"{tt} Actual",
+            line=dict(color=col, width=2),
+            marker=dict(size=7),
+        )
+    )
+    fig_mta.add_trace(
+        go.Scatter(
+            x=grp["approx_date"],
+            y=grp["predicted"],
+            mode="lines+markers",
+            name=f"{tt} Forecast",
+            line=dict(color=col, width=2, dash="dash"),
+            marker=dict(size=6, symbol="x"),
+        )
+    )
+
+try:
+    mta_future = mta_project_quarters(mta_feat, lgb_model, n_future=20)
+    for tt, grp in mta_future.groupby("Trip Type"):
+        col = colors.get(tt, "grey")
+        fig_mta.add_trace(
+            go.Scatter(
+                x=grp["approx_date"],
+                y=grp["Fare_Evasion_proj"],
+                mode="lines+markers",
+                name=f"{tt} Illustrative path",
+                line=dict(color=col, width=2, dash="dot"),
+                marker=dict(size=5),
+            )
+        )
+except Exception as ex:
+    print(f"  MTA multi-step projection skipped: {ex}")
+
+fig_mta.add_vrect(
+    x0=str(COVID_START.date()),
+    x1=str(RECOVERY.date()),
+    fillcolor="red",
+    opacity=0.08,
+    annotation_text="COVID period",
+    annotation_position="top left",
+)
+fig_mta.update_layout(
+    title=(
+        f"MTA Fare Evasion — holdout fit R²={r2_b:.3f}<br>"
+        "<sup>Illustrative paths: seasonal anchor + capped quarter-to-quarter change — "
+        "not calibrated for 2026–2030 policy use</sup>"
+    ),
+    xaxis_title="Date",
+    yaxis_title="Fare Evasion Rate",
+    yaxis_tickformat=".1%",
+    template="plotly_white",
+    height=520,
+    legend=dict(x=1.01, y=1),
+)
+try:
+    fig_mta.write_html(str(OUT_DIR / "02_mta_evasion_forecast.html"))
+    print(f"  Saved {OUT_DIR / '02_mta_evasion_forecast.html'}")
+except Exception as e:
+    print(f"  Plotly HTML export skipped: {e}")
+
+def _lgb_mta_color(name: str) -> str:
+    if name in ("pre_covid", "covid_period", "post_covid", "quarters_since_covid"):
+        return "#E8604C"
+    if name in ("q_sin", "q_cos", "evasion_trend"):
+        return "#9B59B6"
+    return "#4C9BE8"
+
+
+booster = lgb_model.booster_
+_gain = booster.feature_importance(importance_type="gain")
+_split = booster.feature_importance(importance_type="split")
+gs = float(np.sum(_gain)) or 1.0
+ss = float(np.sum(_split)) or 1.0
+imp_gain = pd.Series(_gain / gs * 100.0, index=MTA_FEATURES).sort_values()
+imp_split = pd.Series(_split / ss * 100.0, index=MTA_FEATURES).sort_values()
+
+perm = permutation_importance(
+    lgb_model,
+    X_te,
+    y_te,
+    n_repeats=20,
+    random_state=RANDOM_STATE,
+    n_jobs=-1,
+    scoring="r2",
+)
+imp_perm_raw = np.maximum(perm.importances_mean, 0.0)
+pm = float(np.sum(imp_perm_raw)) or 1.0
+imp_perm = pd.Series(imp_perm_raw / pm * 100.0, index=MTA_FEATURES).sort_values()
+
+fig_fi, axes = plt.subplots(1, 3, figsize=(16, 5))
+for ax, sers, title, xlab in zip(
+    axes,
+    [imp_gain, imp_split, imp_perm],
+    [
+        "Split gain (% of total)",
+        "Split count (% of total)",
+        "Permutation mean ΔR² (shuffled vs test; % of sum)",
+    ],
+    ["Gain %", "Split %", "Permutation %"],
+):
+    cols = [_lgb_mta_color(i) for i in sers.index]
+    sers.plot(kind="barh", ax=ax, color=cols)
+    ax.set_title(title)
+    ax.set_xlabel(xlab)
+    ax.axvline(0, color="grey", lw=0.5)
+
+axes[0].legend(
+    handles=[
+        mpatches.Patch(color="#E8604C", label="COVID dummies / quarters_since_covid"),
+        mpatches.Patch(color="#9B59B6", label="Seasonal & trend (q_sin, q_cos, evasion_trend)"),
+        mpatches.Patch(color="#4C9BE8", label="Other"),
+    ],
+    loc="lower right",
+    fontsize=8,
+)
+plt.suptitle(
+    "LightGBM: trees rarely split on COVID dummies when lags + quarter_index suffice — "
+    "check permutation panel",
+    fontsize=10,
+    y=1.02,
+)
+plt.tight_layout()
+savefig("02b_lgb_feature_importance")
+plt.close()
+
+
+# =============================================================================
+#  COMPONENT 3 — XGBOOST ACTIVE TRANSPORT
+# =============================================================================
+print("\n" + "=" * 60)
+print("COMPONENT 3 — XGBoost Active Transport Predictor")
+print("=" * 60)
+
+SAMPLE = 300_000
+df_ml = (
+    combined.sample(SAMPLE, random_state=RANDOM_STATE)
+    if len(combined) > SAMPLE
+    else combined.copy()
+)
+
+FEATURES = [
+    "latitude",
+    "longitude",
+    "district",
+    "hour",
+    "dow",
+    "month",
+    "week",
+    "dayofyear",
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos",
+    "month_sin",
+    "month_cos",
+    "is_weekend",
+    "is_am_peak",
+    "is_pm_peak",
+    "direction_enc",
+    "count_type_enc",
+    "is_bicycle",
+    "pre_covid",
+    "covid_lockdown",
+    "post_covid",
+    "months_since_covid",
+]
+if "loc_id" in df_ml.columns:
+    pass  # deliberately omit loc_id to avoid memorizing sites
+
+TARGET = "count"
+
+X = df_ml[FEATURES]
+y = df_ml[TARGET]
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=RANDOM_STATE)
+print(f"Train: {len(X_train):,}  |  Test: {len(X_test):,}")
+
+xgb_model = xgb.XGBRegressor(
+    n_estimators=500,
+    max_depth=8,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    min_child_weight=5,
+    reg_lambda=1.0,
+    random_state=RANDOM_STATE,
+    tree_method="hist",
+    n_jobs=-1,
+    early_stopping_rounds=30,
+    eval_metric="rmse",
+    verbosity=0,
+)
+print("Training XGBoost …")
+xgb_model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+
+y_pred_xgb = xgb_model.predict(X_test).clip(0)
+mae_a = mean_absolute_error(y_test, y_pred_xgb)
+rmse_a = np.sqrt(mean_squared_error(y_test, y_pred_xgb))
+r2_a = r2_score(y_test, y_pred_xgb)
+print(f"  MAE={mae_a:.3f}  RMSE={rmse_a:.3f}  R²={r2_a:.4f}")
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+idx = np.random.choice(len(y_test), min(5000, len(y_test)), replace=False)
+yt, yp = np.array(y_test)[idx], y_pred_xgb[idx]
+axes[0].scatter(yt, yp, alpha=0.25, s=6, color="steelblue")
+lims = [min(yt.min(), yp.min()), max(yt.max(), yp.max())]
+axes[0].plot(lims, lims, "r--", lw=1.5, label="Perfect prediction")
+axes[0].set_xlabel("Actual Count")
+axes[0].set_ylabel("Predicted Count")
+axes[0].set_title(f"XGBoost — Actual vs Predicted  (R²={r2_a:.3f})")
+axes[0].legend()
+
+imp = pd.Series(xgb_model.feature_importances_, index=FEATURES).sort_values(ascending=True)
+bar_colors = ["#E8604C" if "covid" in i else "#4C9BE8" for i in imp.index]
+imp.tail(15).plot(kind="barh", ax=axes[1], color=bar_colors[-15:])
+axes[1].set_title("XGBoost Feature Importances (top 15)\nred = COVID-era features")
+axes[1].set_xlabel("Importance")
+axes[1].legend(
+    handles=[
+        mpatches.Patch(color="#E8604C", label="COVID feature"),
+        mpatches.Patch(color="#4C9BE8", label="Other feature"),
+    ]
+)
+plt.tight_layout()
+savefig("03_xgb_scatter_importance")
+plt.close()
+
+med_cal = df_ml[FEATURES].median(numeric_only=True)
+months_range = np.linspace(0, 90, 46)
+pdp_rows = []
+for m in months_range:
+    dt = COVID_START + pd.Timedelta(days=float(m * 30.4375))
+    pdp_rows.append(caltrans_feature_row(dt, med_cal))
+pdp_df = pd.DataFrame(pdp_rows)
+pred_by_month = xgb_model.predict(pdp_df[FEATURES]).clip(0)
+
+fig3, ax3 = plt.subplots(figsize=(10, 4))
+ax3.plot(months_range, pred_by_month, marker="o", color="steelblue", lw=2, ms=3)
+ax3.axvline(0, color="red", ls="--", lw=1.5, label="COVID start (synthetic clock)")
+ax3.axvline(LOCKDOWN_END_MONTHS, color="green", ls="--", lw=1.5, label="Recovery window (~15 mo)")
+_mlock = months_range < LOCKDOWN_END_MONTHS
+ax3.fill_between(months_range[_mlock], np.asarray(pred_by_month)[_mlock], alpha=0.2, color="red")
+ax3.set_xlabel("Months since COVID start (synthetic timeline + calendar features)")
+ax3.set_ylabel("Predicted count (median site / hour profile)")
+ax3.set_title(
+    "Scenario curve: prediction vs pandemic month-index\n(calendar + era dummies co-evolve; not a causal dose-response)"
+)
+ax3.legend()
+plt.tight_layout()
+savefig("03b_partial_dependence_months")
+plt.close()
+
+
+# =============================================================================
+#  COMPONENT 4 — IMPACT CLUSTERING (KMeans + PCA)
+#  Groups sensors by *shape* of change between two windows (pre/post COVID when
+#  both exist; otherwise early vs late record window per sensor).
+# =============================================================================
+print("\n" + "=" * 60)
+print("COMPONENT 4 — Impact Clustering (KMeans)")
+print("=" * 60)
+
+
+def compute_behavior_windows(g):
+    """Return two subsets of rows for a single loc_id group."""
+    g = g.sort_values("datetime")
+    pre_m = g["datetime"] < COVID_START
+    post_m = g["datetime"] >= RECOVERY
+    if pre_m.sum() >= 24 and post_m.sum() >= 24:
+        a, b = g[pre_m], g[post_m]
+        mode = "pre_post_covid"
+    else:
+        med = g["datetime"].median()
+        a, b = g[g["datetime"] < med], g[g["datetime"] >= med]
+        mode = "early_late_split"
+        if len(a) < 24 or len(b) < 24:
+            return None
+    return a, b, mode
+
+
+rows = []
+if "loc_id" not in combined.columns:
+    print("  No loc_id column — skip sensor clustering.")
+else:
+    for loc_id, g in combined.groupby("loc_id"):
+        out = compute_behavior_windows(g)
+        if out is None:
+            continue
+        a, b, mode = out
+
+        def stats(block):
+            mu = block["count"].mean()
+            sd = block["count"].std()
+            return {
+                "mean": mu,
+                "cv": sd / (mu + 1e-6),
+                "weekend_share": block["is_weekend"].mean(),
+                "am_peak_share": block["is_am_peak"].mean(),
+                "pm_peak_share": block["is_pm_peak"].mean(),
+                "bike_share": (block["mode_label"] == "Bicycle").mean(),
+            }
+
+        sa, sb = stats(a), stats(b)
+        rows.append(
+            {
+                "loc_id": loc_id,
+                "district": g["district"].iloc[0],
+                "split_mode": mode,
+                "log_mean_a": np.log1p(sa["mean"]),
+                "log_mean_b": np.log1p(sb["mean"]),
+                "delta_log_mean": np.log1p(sb["mean"]) - np.log1p(sa["mean"]),
+                "delta_cv": sb["cv"] - sa["cv"],
+                "delta_weekend": sb["weekend_share"] - sa["weekend_share"],
+                "delta_am_peak": sb["am_peak_share"] - sa["am_peak_share"],
+                "delta_bike_share": sb["bike_share"] - sa["bike_share"],
+                "n_a": len(a),
+                "n_b": len(b),
+            }
+        )
+
+    cluster_df = pd.DataFrame(rows)
+    print(f"  Sensors with enough data for two-window contrast: {len(cluster_df)}")
+
+    if len(cluster_df) >= 8:
+        clust_feats = [
+            "delta_log_mean",
+            "delta_cv",
+            "delta_weekend",
+            "delta_am_peak",
+            "delta_bike_share",
+        ]
+        Xc = cluster_df[clust_feats].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        scaler = StandardScaler()
+        Xs = scaler.fit_transform(Xc)
+        k = min(5, max(2, len(cluster_df) // 15))
+        km = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=10)
+        cluster_df["cluster"] = km.fit_predict(Xs)
+
+        pca = PCA(n_components=2, random_state=RANDOM_STATE)
+        xy = pca.fit_transform(Xs)
+        cluster_df["pc1"] = xy[:, 0]
+        cluster_df["pc2"] = xy[:, 1]
+
+        print(f"  KMeans k={k} | split modes: {cluster_df['split_mode'].value_counts().to_dict()}")
+
+        fig_c, axc = plt.subplots(figsize=(9, 7))
+        for c in sorted(cluster_df["cluster"].unique()):
+            sub = cluster_df[cluster_df["cluster"] == c]
+            axc.scatter(sub["pc1"], sub["pc2"], s=40, alpha=0.75, label=f"Cluster {c}")
+        axc.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.0%} var)")
+        axc.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.0%} var)")
+        axc.set_title("Sensor impact clusters (PCA of Δ-behavior features)")
+        axc.legend()
+        axc.axhline(0, color="grey", lw=0.5)
+        axc.axvline(0, color="grey", lw=0.5)
+        plt.tight_layout()
+        savefig("04_impact_clusters_pca")
+        plt.close()
+
+        prof = cluster_df.groupby("cluster")[clust_feats].mean()
+        print("\n  Cluster profiles (mean Δ features):")
+        print(prof.round(4).to_string())
+    else:
+        print("  Too few sensors for clustering after filters.")
+
+
+# =============================================================================
+#  COMPONENT 5 — FUTURE TRANSPORTATION FORECAST
+# =============================================================================
+print("\n" + "=" * 60)
+print("COMPONENT 5 — Future Transportation Forecast (extrapolation)")
+print("=" * 60)
+
+last_dt = combined["datetime"].max()
+anchor_y, anchor_m = int(last_dt.year), int(last_dt.month)
+future_calendar = []
+future_msci = []
+fut_rows = []
+for i in range(1, 37):
+    dt = pd.Timestamp(year=anchor_y, month=anchor_m, day=15) + pd.DateOffset(months=i)
+    future_calendar.append(dt)
+    future_msci.append(max(0.0, (dt - COVID_START).days / 30.44))
+    fut_rows.append(caltrans_feature_row(dt, med_cal))
+future = pd.DataFrame(fut_rows)
+future_pred = xgb_model.predict(future[FEATURES]).clip(0)
+
+fig_forecast, ax = plt.subplots(figsize=(11, 4))
+ax.plot(future_calendar, future_pred, marker="o", lw=2, color="steelblue", ms=4)
+ax.axvline(last_dt, color="red", linestyle="--", label="Last observed Caltrans date")
+ax.set_title("Scenario forecast: +36 months with rolling calendar features (median site)")
+ax.set_xlabel("Calendar date")
+ax.set_ylabel("Predicted hourly count")
+ax.tick_params(axis="x", rotation=20)
+ax.legend()
+plt.tight_layout()
+savefig("05_future_forecast")
+plt.close()
+
+print(f"Forecast generated for {len(future_calendar)} future months from last data {last_dt.date()}")
+
+
+# =============================================================================
+#  COMPONENT 6 — DISTRICT GROWTH (scenario)
+# =============================================================================
+print("\n" + "=" * 60)
+print("COMPONENT 6 — District Growth (scenario bars)")
+print("=" * 60)
+
+districts = df_ml["district"].dropna().unique()
+district_results = []
+for d in districts:
+    temp = future.copy()
+    temp["district"] = d
+    pred = xgb_model.predict(temp).mean()
+    district_results.append((d, pred))
+
+district_df = pd.DataFrame(district_results, columns=["district", "future_pred"]).sort_values(
+    "future_pred", ascending=False
+)
+district_df["district_label"] = district_df["district"].map(district_label)
+
+plt.figure(figsize=(11, 4))
+xpos = np.arange(len(district_df))
+plt.bar(xpos, district_df["future_pred"])
+plt.xticks(xpos, district_df["district_label"], rotation=35, ha="right")
+plt.title("Scenario: mean predicted count by Caltrans district (+36 mo, median profile)")
+plt.ylabel("Predicted hourly count (mean over horizon)")
+plt.tight_layout()
+savefig("06_district_forecast")
+plt.close()
+
+
+# =============================================================================
+#  COMPONENT 7 — FUNDING PRESSURE INDEX
+# =============================================================================
+print("\n" + "=" * 60)
+print("COMPONENT 7 — Funding Pressure Index")
+print("=" * 60)
+
+evasion_q = mta_feat[mta_feat["Trip Type"] == "Total"][["approx_date", "Fare Evasion", "quarter_index"]].copy()
+
+combined_for_fpi = combined.copy()
+combined_for_fpi["quarter_dt"] = combined_for_fpi["datetime"].dt.to_period("Q").dt.start_time
+active_q = (
+    combined_for_fpi.groupby("quarter_dt")["count"]
+    .mean()
+    .reset_index()
+    .rename(columns={"quarter_dt": "approx_date", "count": "active_avg"})
+)
+
+pre_baseline = active_q[active_q["approx_date"] < COVID_START]["active_avg"].mean()
+if pre_baseline and not np.isnan(pre_baseline):
+    active_q["active_norm"] = active_q["active_avg"] / max(pre_baseline, 1e-6)
+else:
+    overall_mean = active_q["active_avg"].mean()
+    active_q["active_norm"] = active_q["active_avg"] / max(overall_mean, 1e-6)
+
+fpi_df = pd.merge(evasion_q, active_q, on="approx_date", how="inner")
+
+evasion_baseline = fpi_df[fpi_df["approx_date"] < COVID_START]["Fare Evasion"].mean()
+if evasion_baseline and not np.isnan(evasion_baseline):
+    fpi_df["evasion_norm"] = fpi_df["Fare Evasion"] / max(evasion_baseline, 1e-6)
+else:
+    em = fpi_df["Fare Evasion"].mean()
+    fpi_df["evasion_norm"] = fpi_df["Fare Evasion"] / max(em, 1e-6)
+
+fpi_df["FPI"] = fpi_df["evasion_norm"] * 0.6 + fpi_df["active_norm"] * 0.4
+den = fpi_df["FPI"].max() - fpi_df["FPI"].min()
+if den > 0:
+    fpi_df["FPI"] = (fpi_df["FPI"] - fpi_df["FPI"].min()) / den * 100
+
+plt.figure(figsize=(10, 4))
+plt.plot(fpi_df["approx_date"], fpi_df["FPI"], marker="o")
+plt.title("Funding Pressure Index Over Time")
+plt.ylabel("FPI (0-100)")
+plt.xlabel("Date")
+plt.tight_layout()
+savefig("07_funding_pressure_index")
+plt.close()
+
+peak_fpi_date = fpi_df.loc[fpi_df["FPI"].idxmax(), "approx_date"]
+print(f"Peak funding pressure: {peak_fpi_date.date()}")
+
+
+# =============================================================================
+#  SUMMARY
+# =============================================================================
+print("\n" + "=" * 60)
+print("FINAL MODEL SUMMARY")
+print("=" * 60)
+
+results = pd.DataFrame(
+    [
+        {
+            "Component": "Behavior Shift Detection",
+            "Method": "Isolation Forest (+ optional ruptures)",
+            "Finding": f"Active transport Pre→Post: {pc_str}",
+        },
+        {
+            "Component": "Fare Evasion Forecast",
+            "Method": f"LightGBM (R²={r2_b:.3f})",
+            "Finding": "See MTA era means + holdout predictions",
+        },
+        {
+            "Component": "Active Transport Model",
+            "Method": f"XGBoost (R²={r2_a:.3f})",
+            "Finding": "COVID features informative only if dates span eras",
+        },
+        {
+            "Component": "Impact Clustering",
+            "Method": "KMeans on standardized Δ-behavior features",
+            "Finding": "Groups sensors by how patterns shifted between windows",
+        },
+        {
+            "Component": "Future Forecast",
+            "Method": "XGBoost extrapolation",
+            "Finding": "Scenario only — not a validated long-run forecast",
+        },
+        {
+            "Component": "Funding Pressure Index",
+            "Method": "Composite evasion + active norm",
+            "Finding": f"Peak FPI quarter ~ {peak_fpi_date.date()}",
+        },
+    ]
+)
+print(results.to_string(index=False))
+print(f"\nArtifacts in: {OUT_DIR}")
+print("Done.")
